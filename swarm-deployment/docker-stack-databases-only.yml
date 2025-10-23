@@ -1,0 +1,136 @@
+version: '3.8'
+
+services:
+  # =============================================================================
+  # PostgreSQL Databases Only - All on Manager Node for data consistency
+  # =============================================================================
+
+  # Panel System Database
+  panel-database:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: CameraPanelDB
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "5436:5432"
+    volumes:
+      - panel_postgres_data:/var/lib/postgresql/data
+    networks:
+      - camera-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d CameraPanelDB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+      placement:
+        constraints:
+          - node.role == manager
+
+  # Shared Public Database (RecordingJobs table)
+  recording-jobs-db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: cloudcam_public
+      POSTGRES_USER: cloudcam
+      POSTGRES_PASSWORD: ${PUBLIC_DB_PASSWORD}
+    ports:
+      - "5433:5432"
+    volumes:
+      - recording_jobs_public_db_data:/var/lib/postgresql/data
+    networks:
+      - camera-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloudcam -d cloudcam_public"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+      placement:
+        constraints:
+          - node.role == manager
+
+  # RecorderScheduler Database
+  recorder-scheduler-db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: recorder_scheduler
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5434:5432"
+    volumes:
+      - recorder_scheduler_db_data:/var/lib/postgresql/data
+    networks:
+      - camera-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev -d recorder_scheduler"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+      placement:
+        constraints:
+          - node.role == manager
+
+  # PlaylistManager Database
+  playlist-manager-db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: playlist_manager
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5435:5432"
+    volumes:
+      - playlist_manager_db_data:/var/lib/postgresql/data
+    networks:
+      - camera-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev -d playlist_manager"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+      placement:
+        constraints:
+          - node.role == manager
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  camera-network:
+    external: true
+
+# =============================================================================  
+# Volumes - All databases use local volumes on manager node
+# =============================================================================
+volumes:
+  # Database volumes - local to manager node
+  panel_postgres_data:
+    driver: local
+  recording_jobs_public_db_data:
+    driver: local
+  recorder_scheduler_db_data:
+    driver: local
+  playlist_manager_db_data:
+    driver: local
+

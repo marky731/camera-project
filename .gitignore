@@ -1,0 +1,8 @@
+camera-v2/*
+camera-v2-panel/*
+test_results/*
+.env*
+*.crt
+*.key
+.DS_Store
+.vscode/*

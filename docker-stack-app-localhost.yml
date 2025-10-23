@@ -1,0 +1,182 @@
+version: '3.8'
+
+services:
+  # Panel API Backend
+  panel-api:
+    image: camera-panel-api:latest
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - ConnectionStrings__DefaultConnection=Host=panel-database;Database=CameraPanelDB;Username=postgres;Password=${DB_PASSWORD}
+      - ConnectionStrings__PublicDatabase=Host=recording-jobs-db;Database=cloudcam_public;Username=cloudcam;Password=${PUBLIC_DB_PASSWORD}
+      - RECORDER_SCHEDULER_URL=http://recorder-scheduler:8080
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+      - JwtSettings__SecretKey=${JWT_SECRET_KEY}
+    networks:
+      - camera-network
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.role == manager
+
+  # Panel Frontend
+  panel-frontend:
+    image: camera-panel-frontend:latest
+    environment:
+      - REACT_APP_API_URL=http://localhost/api
+      - REACT_APP_STREAMING_URL=http://localhost/stream
+    networks:
+      - camera-network
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.role == manager
+
+  # Streaming Service
+  streaming-service:
+    image: camera-streaming-service:latest
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+      - PanelApi__BaseUrl=http://panel-api:8080
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+    networks:
+      - camera-network
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.role == manager
+
+  # RecorderScheduler
+  recorder-scheduler:
+    image: recorder-scheduler:latest
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__DefaultConnection: "Host=recording-jobs-db;Database=cloudcam_public;Username=cloudcam;Password=${PUBLIC_DB_PASSWORD}"
+      ConnectionStrings__PrivateConnection: "Host=recorder-scheduler-db;Database=recorder_scheduler;Username=dev;Password=${POSTGRES_PASSWORD}"
+      RabbitMQ__Host: "rabbitmq"
+      RabbitMQ__Port: "5672"
+      RabbitMQ__Username: "dev"
+      RabbitMQ__Password: "${RABBITMQ_PASSWORD}"
+      RabbitMQ__VirtualHost: "cloudcam"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - camera-network
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+
+  # Recorder
+  recorder:
+    image: recorder:latest
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      RabbitMQ__Host: "rabbitmq"
+      RabbitMQ__Port: "5672"
+      RabbitMQ__Username: "dev"
+      RabbitMQ__Password: "${RABBITMQ_PASSWORD}"
+      RabbitMQ__VirtualHost: "cloudcam"
+      Recorder__DataPath: "/data"
+      Recorder__FFmpegPath: "ffmpeg"
+      ConnectionStrings__DefaultConnection: "Data Source=/app/local/recorder.db"
+      Database__ConnectionString: "Data Source=/app/local/recorder.db"
+    volumes:
+      # Use local directory for video storage (simulates NFS mount)
+      - ./storage/localhost-cameraswarm:/data
+      # Local volume for SQLite database (matches production)
+      - recorder_local:/app/local
+    networks:
+      - camera-network
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.role == manager
+
+  # PlaylistManager
+  playlist-manager:
+    image: playlist-manager:latest
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__DefaultConnection: "Host=playlist-manager-db;Database=playlist_manager;Username=dev;Password=${POSTGRES_PASSWORD}"
+      RabbitMQ__Host: "rabbitmq"
+      RabbitMQ__Port: "5672"
+      RabbitMQ__Username: "dev"
+      RabbitMQ__Password: "${RABBITMQ_PASSWORD}"
+      RabbitMQ__VirtualHost: "cloudcam"
+      PlaylistManager__S3BucketName: "${S3_BUCKET_NAME}"
+      PlaylistManager__CDNBaseUrl: "${CDN_BASE_URL}"
+      PlaylistManager__SignedUrlExpirationMinutes: "${SIGNED_URL_EXPIRATION_MINUTES}"
+      PlaylistManager__S3Endpoint: "${S3_ENDPOINT}"
+      PlaylistManager__S3AccessKey: "${S3_ACCESS_KEY}"
+      PlaylistManager__S3SecretKey: "${S3_SECRET_KEY}"
+      PlaylistManager__S3UseSSL: "${S3_USE_SSL}"
+    volumes:
+      # Use local directory for video storage (read-only, simulates NFS mount)
+      - ./storage/localhost-cameraswarm:/data:ro
+    networks:
+      - camera-network
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+
+  # Player API
+  player-api:
+    image: player-api:latest
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+      PlaylistManager__BaseUrl: "http://playlist-manager:8082"
+      PlaylistManager__ExternalBaseUrl: "http://localhost/playlist"
+    networks:
+      - camera-network
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - node.role == manager
+
+  # Player Frontend
+  player-frontend:
+    image: player-frontend:latest
+    environment:
+      VITE_API_BASE_URL: "http://localhost/player-api"
+    networks:
+      - camera-network
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+
+networks:
+  camera-network:
+    external: true
+
+volumes:
+  recorder_local:
+    driver: local

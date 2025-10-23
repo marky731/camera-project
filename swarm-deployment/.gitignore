@@ -1,0 +1,23 @@
+# Environment files with sensitive data
+.env.swarm
+.env
+.env.*
+
+# SSL certificates
+ssl/
+*.pem
+*.key
+*.crt
+*.cer
+
+# Logs
+*.log
+logs/
+
+# Docker volumes
+docker-stack-app-distributed.yml
+
+# Temporary files
+*.tmp
+*.bak
+*~
