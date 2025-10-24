@@ -20,7 +20,7 @@ CUDA_LIBS = -L/usr/local/cuda/lib64 -lcudart -lcuda
 
 # Compiler flags
 CFLAGS = -O3 -Wall -pthread $(FFMPEG_CFLAGS) $(CUDA_CFLAGS)
-LDFLAGS = $(FFMPEG_LIBS) $(CUDA_LIBS) -pthread -lm
+LDFLAGS = $(FFMPEG_LIBS) $(CUDA_LIBS) -pthread -lm -lmicrohttpd -lcurl -lcjson
 
 # Build rules
 all: $(TARGET)

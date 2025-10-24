@@ -29,12 +29,15 @@
 
 | Step | Component | Status | Priority | Notes |
 |------|-----------|--------|----------|-------|
-| 1 | TranscoderBridge Service | 🔴 Not Started | Critical | |
-| 2 | Recorder Modifications | 🔴 Not Started | Critical | |
-| 3 | S3Uploader Modifications | 🔴 Not Started | Critical | |
-| 4 | Docker Compose Setup | 🔴 Not Started | Critical | |
-| 5 | Mock Transcoder API | 🔴 Not Started | For Testing | |
-| 6 | End-to-End Validation | 🔴 Not Started | Final Check | |
+| 1 | TranscoderBridge Service | 🟢 Complete | Critical | All files created |
+| 2 | Recorder Modifications | 🟢 Complete | Critical | FFmpeg + messages |
+| 3 | S3Uploader Modifications | 🟢 Complete | Critical | Queue binding updated |
+| 4 | Docker Compose Setup | 🟢 Complete | Critical | Both services added |
+| 5 | Add --no-gpu to transcoder.c | 🟢 Complete | For Testing | Flag implemented |
+| 6 | Local Isolation Config | 🟢 Complete | Critical | Override files created |
+| 7 | Panel Integration | 🟢 Complete | Optional | Panel isolated from prod |
+| 8 | Pre-flight Check | 🟢 Complete | Final Check | All verifications passed |
+| 9 | End-to-End Testing | 🟡 Ready to Start | Validation | User to begin testing |
 
 ---
 
@@ -134,10 +137,23 @@ app.Run("http://0.0.0.0:8081");
     "recordingJobId": "...",
     "recordingId": "...",
     "fileName": "0.ts",
+    "filePath": message.FilePath,  // Pass through for callback
     "segmentStart": "...",
     "segmentDuration": 10
   }
 }
+```
+
+**WebhookController Callback Handling**:
+```csharp
+// When transcoder calls back with outputFile:
+// Phase 1: outputFile = inputFile (raw segment path)
+// Phase 2: outputFile = transcoded file path
+
+var outputPath = Path.Combine(_config["TranscoderBridge:DataPath"]!, callback.OutputFile);
+// OR if callback returns full path, use it directly
+
+message.FilePath = outputPath;  // S3Uploader will read from this path
 ```
 
 ---
@@ -191,6 +207,8 @@ Change queue name from `segment.ready` to `segment.raw.ready` in message publish
 
 ## 🔧 Step 3: S3Uploader Modifications
 
+### Code Changes
+
 **File**: `camera-v2/S3Uploader/Services/RabbitMQConsumer.cs`
 
 **Change queue binding**:
@@ -206,12 +224,63 @@ channel.QueueBind("segment.upload.queue", "segment.transcoded.ready", "");
 
 **Update file path logic** to use `message.FilePath` directly (already contains full path from TranscoderBridge)
 
+### S3 Configuration (Two Buckets)
+
+**File**: `camera-v2/S3Uploader/appsettings.json`
+
+Update S3 section to support test bucket:
+```json
+{
+  "S3": {
+    "Endpoint": "s3.wasabisys.com",
+    "BucketName": "your-test-bucket",
+    "AccessKey": "${S3_ACCESS_KEY}",
+    "SecretKey": "${S3_SECRET_KEY}",
+    "UseSSL": true
+  }
+}
+```
+
+**Environment-based Configuration**:
+
+**Phase 1 (Test Server - Wasabi)**:
+```yaml
+# docker-compose.yml
+s3-uploader:
+  environment:
+    S3__Endpoint: "s3.wasabisys.com"
+    S3__BucketName: "your-wasabi-test-bucket"
+    S3__AccessKey: "${WASABI_ACCESS_KEY}"
+    S3__SecretKey: "${WASABI_SECRET_KEY}"
+    S3__UseSSL: "true"
+```
+
+**Phase 2 (GPU Server - Production MinIO)**:
+```yaml
+# docker-compose.yml (on GPU server)
+s3-uploader:
+  environment:
+    S3__Endpoint: "nbpublic.narbulut.com"
+    S3__BucketName: "berkin-test"
+    S3__AccessKey: "${MINIO_ACCESS_KEY}"
+    S3__SecretKey: "${MINIO_SECRET_KEY}"
+    S3__UseSSL: "true"
+```
+
+**Add to .env file (Test Server)**:
+```bash
+WASABI_ACCESS_KEY=your_wasabi_access_key
+WASABI_SECRET_KEY=your_wasabi_secret_key
+```
+
+### Docker Volume Mounts
+
 **Add volume mount in docker-compose.yml**:
 ```yaml
 s3-uploader:
   volumes:
-    - recorder_data:/data:ro  # Existing
-    - transcoder_output:/workspace/output:ro  # NEW - read transcoded files
+    - recorder_data:/data:ro  # Existing - for raw segments in Phase 1
+    - transcoder_output:/workspace/output:ro  # NEW - for transcoded files in Phase 2
 ```
 
 ---
@@ -287,52 +356,81 @@ EXPOSE 8080
 CMD ["/app/transcoder"]
 ```
 
-**⚠️ Phase 1 Note**: This Dockerfile requires GPU hardware (CUDA base image). For Phase 1 testing on test server **without GPU**, use the Python mock transcoder instead (see Step 5 below). This Dockerfile will be used in Phase 2 on the GPU server.
+**⚠️ Phase 1 Note**: This Dockerfile uses CUDA base image but will work on test server when running transcoder with `--no-gpu` flag (see Step 5). The same binary works for both Phase 1 (no GPU) and Phase 2 (with GPU).
 
 ---
 
-## 🔧 Step 5: Mock Transcoder for Testing (Phase 1)
+## 🔧 Step 5: Modify transcoder.c for Phase 1 (No-GPU Mode)
 
-Since we don't have GPU on test server, create a simple mock that:
+Add `--no-gpu` flag to transcoder.c to run without GPU hardware for testing.
 
-1. Listens on port 8080
-2. Accepts POST `/enqueue` with full file path
-3. Immediately calls back to webhook with success
-4. Doesn't actually transcode (just copies file or creates dummy output)
+**File**: `transcoder.c`
 
-**Quick Python Mock** (optional for testing):
-```python
-from flask import Flask, request
-import requests
-import shutil
-import os
+**Add global variable** (after includes, around line 80):
+```c
+static int no_gpu_mode = 0;  // Test mode flag
+```
 
-app = Flask(__name__)
+**Modify main() function** to accept flag (around line 650):
+```c
+int main(int argc, char *argv[]) {
+    // Check for no-GPU mode
+    if (argc > 1 && strcmp(argv[1], "--no-gpu") == 0) {
+        no_gpu_mode = 1;
+        printf("⚠️  Running in NO-GPU mode (testing only - file copy instead of transcode)\n");
+    }
 
-@app.route('/enqueue', methods=['POST'])
-def enqueue():
-    data = request.json
-    callback_url = data['callbackUrl']
-    input_path = data['inputPath']  # Full path from message
+    // ... rest of existing main() code
+}
+```
 
-    # Create dummy output file (just copy)
-    output_filename = os.path.basename(input_path).replace('.ts', '_h264.ts')
-    output_path = f'/workspace/output/{output_filename}'
-    shutil.copy(input_path, output_path)
+**Modify worker_thread()** to skip GPU transcoding (around line 450, in processing loop):
+```c
+if (no_gpu_mode) {
+    // Phase 1 testing: Just acknowledge, send back input path for S3 upload
+    printf("⚠️  NO-GPU mode: Received %s - would transcode if GPU available\n", job.filename);
 
-    # Immediately callback
-    requests.post(callback_url, json={
-        'inputFile': os.path.basename(input_path),
-        'outputFile': output_filename,
-        'frameCount': 250,
-        'status': 'completed',
-        'processingTimeMs': 10,
-        'metadata': data['metadata']
-    })
-    return {'status': 'queued'}
+    // In no-GPU mode, send back the INPUT path (raw segment)
+    // This allows S3Uploader to upload the raw file for testing
+    // In Phase 2, this will be the transcoded output path instead
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    // Immediately send completion callback (no actual work)
+    notify_completion(job.callback_url,
+                     job.filename,           // inputFile
+                     job.filename,           // outputFile = inputFile (Phase 1)
+                     0,                      // frame_count = 0 (no processing)
+                     1,                      // processing_time_ms = 1ms (instant)
+                     job.metadata_json,
+                     "completed");
+
+    printf("✅ Acknowledgment sent - S3Uploader will upload raw segment\n");
+} else {
+    // Phase 2: Normal GPU transcoding
+    // ... existing NVDEC/NVENC code ...
+    // Will send actual transcoded output path
+}
+```
+
+**Note**:
+- **Phase 1**: Sends input path back → S3Uploader uploads **raw segment**
+- **Phase 2**: Sends output path back → S3Uploader uploads **transcoded segment**
+
+**Update docker-compose.yml** to use no-GPU mode in Phase 1:
+```yaml
+transcoder:
+  build:
+    context: ..
+    dockerfile: Dockerfile.transcoder
+  container_name: camera-v2-transcoder
+  volumes:
+    - recorder_data:/data:ro
+    - transcoder_output:/workspace/output
+  ports:
+    - "8080:8080"
+  command: ["/app/transcoder", "--no-gpu"]  # Phase 1: No GPU mode
+  restart: unless-stopped
+  # For Phase 2 on GPU server, remove command line or change to:
+  # command: ["/app/transcoder"]  # Will use GPU
 ```
 
 ---
@@ -390,8 +488,9 @@ docker-compose logs s3-uploader | grep "Upload successful"
 - All services start without errors
 - Messages flow through complete pipeline
 - Callbacks received and processed
+- Raw segments uploaded to **Wasabi S3** successfully
 - No crashes or connection issues
-- Ready to copy to GPU server
+- Ready to copy to GPU server (will switch to MinIO/production bucket)
 
 ---
 
@@ -409,14 +508,18 @@ Stop new services: `docker-compose stop transcoder transcoder-bridge`
 
 ## 📝 Implementation Order
 
-1. ✅ Create TranscoderBridge service files
-2. ✅ Modify Recorder (FFmpeg + messages)
-3. ✅ Modify S3Uploader (queue binding)
-4. ✅ Update docker-compose.yml
-5. ✅ Create Dockerfile.transcoder
-6. ✅ Build and test locally
-7. ✅ Validate end-to-end flow
-8. ⏸️ Move to GPU server (Phase 2)
+1. ✅ Add `--no-gpu` flag to transcoder.c
+2. ✅ Create TranscoderBridge service files
+3. ✅ Modify Recorder (FFmpeg + messages)
+4. ✅ Modify S3Uploader (queue binding)
+5. ✅ Update docker-compose.yml
+6. ✅ Create docker-compose.override.yml for local isolation
+7. ✅ Configure Panel for local testing
+8. ✅ Create .env files with credentials
+9. ✅ Pre-flight check - all systems verified
+10. 🟡 **User Testing** - Ready to start (current step)
+11. ⏸️ Move to GPU server (Phase 2)
+12. ⏸️ Change transcoder command to remove `--no-gpu` flag
 
 ---
 
@@ -430,13 +533,31 @@ Stop new services: `docker-compose stop transcoder transcoder-bridge`
 - Refactored to two-phase approach (test server → GPU server)
 - **Removed symlink complexity** - using direct volume mounts instead
 - Simplified architecture: 4 services instead of 5 (no SymlinkManager)
+- **Added `--no-gpu` flag to transcoder.c** - same binary for both phases, no Python mock needed
+- **S3 bucket strategy**: Wasabi for Phase 1 testing, MinIO for Phase 2 production
 
-### Session 2: [Date] - [Work Done]
-- Status updates go here
-- Track progress with emoji indicators in table above
+### Session 2: 2025-10-23 - Implementation Complete
+- ✅ Implemented all Phase 1 components
+- ✅ Created TranscoderBridge service (complete .NET 9.0 microservice)
+- ✅ Modified Recorder for raw H.264 pass-through
+- ✅ Modified S3Uploader for transcoded segment consumption
+- ✅ Created Docker infrastructure (Dockerfile.transcoder, docker-compose updates)
+- ✅ Implemented complete production isolation strategy
+- ✅ Created docker-compose.override.yml for camera-v2 and camera-v2-panel
+- ✅ Configured Panel to connect to local services
+- ✅ Created .env files with user's Wasabi credentials
+- ✅ Completed comprehensive pre-flight check
+- ✅ Verified zero production exposure
+- ✅ All documentation updated
+
+**Issues Resolved:**
+- Attempted to modify production docker-compose.yml → Fixed with override pattern
+- Used production IP 172.17.12.97 → Changed to localhost/host.docker.internal
+- Added :9000 port to S3 endpoint → Removed per user feedback
+- Panel connecting to production DB → Created override file for local isolation
 
 ---
 
 **Last Updated**: 2025-10-23
-**Status**: Ready for Phase 1 Implementation
-**Next Action**: Create TranscoderBridge service directory structure
+**Status**: ✅ Phase 1 Complete - Pre-flight Check Passed - Ready for Testing
+**Next Action**: User to run `docker-compose up -d` and begin end-to-end testing

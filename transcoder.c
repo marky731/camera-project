@@ -27,6 +27,7 @@
 #include <cuda_runtime.h>
 #include <microhttpd.h>
 #include <cjson/cJSON.h>
+#include <curl/curl.h>
 #include <signal.h>
 #include <time.h>
 
@@ -38,9 +39,16 @@
 #define OUTPUT_DIR "/workspace/transcode-test-5090/output"
 #define API_PORT 8080           // HTTP API port
 
+// Job information including callback details
+typedef struct {
+    char filename[512];
+    char callback_url[512];
+    char metadata_json[2048];
+} TranscodeJob;
+
 // Queue system for task distribution
 typedef struct {
-    char files[MAX_QUEUE_SIZE][512];
+    TranscodeJob jobs[MAX_QUEUE_SIZE];
     int front;
     int rear;
     int count;
@@ -79,6 +87,7 @@ volatile int processing_active = 1;
 volatile int files_processed = 0;
 volatile int files_failed = 0;
 time_t start_time;
+static int no_gpu_mode = 0;  // Phase 1 test mode: no actual transcoding
 
 // Statistics
 pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -99,15 +108,14 @@ void queue_init(TaskQueue *q) {
     pthread_cond_init(&q->not_full, NULL);
 }
 
-void queue_push(TaskQueue *q, const char *filename) {
+void queue_push(TaskQueue *q, const TranscodeJob *job) {
     pthread_mutex_lock(&q->mutex);
 
     while (q->count >= MAX_QUEUE_SIZE) {
         pthread_cond_wait(&q->not_full, &q->mutex);
     }
 
-    strncpy(q->files[q->rear], filename, 511);
-    q->files[q->rear][511] = '\0';
+    q->jobs[q->rear] = *job;
     q->rear = (q->rear + 1) % MAX_QUEUE_SIZE;
     q->count++;
 
@@ -115,7 +123,7 @@ void queue_push(TaskQueue *q, const char *filename) {
     pthread_mutex_unlock(&q->mutex);
 }
 
-int queue_pop(TaskQueue *q, char *filename) {
+int queue_pop(TaskQueue *q, TranscodeJob *job) {
     pthread_mutex_lock(&q->mutex);
 
     while (q->count == 0 && processing_active) {
@@ -127,8 +135,7 @@ int queue_pop(TaskQueue *q, char *filename) {
         return 0;
     }
 
-    strncpy(filename, q->files[q->front], 511);
-    filename[511] = '\0';
+    *job = q->jobs[q->front];
     q->front = (q->front + 1) % MAX_QUEUE_SIZE;
     q->count--;
 
@@ -699,6 +706,76 @@ int process_file(TranscodeContext *ctx, const char *input_filename) {
 }
 
 // ============================================================================
+// HTTP Callback Notification
+// ============================================================================
+
+// Callback for curl to discard response data
+static size_t discard_response_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+    return size * nmemb;  // Discard response
+}
+
+// Send completion notification to callback URL
+int send_completion_callback(const char *callback_url, const char *input_file,
+                             const char *output_file, int frame_count,
+                             int processing_time_ms, const char *metadata_json,
+                             const char *status) {
+    if (!callback_url || strlen(callback_url) == 0) {
+        return 0;  // No callback URL provided, skip
+    }
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        fprintf(stderr, "[Callback] Failed to initialize curl\n");
+        return -1;
+    }
+
+    // Build JSON payload
+    cJSON *json = cJSON_CreateObject();
+    cJSON_AddStringToObject(json, "status", status);
+    cJSON_AddStringToObject(json, "inputFile", input_file);
+    cJSON_AddStringToObject(json, "outputFile", output_file);
+    cJSON_AddNumberToObject(json, "frameCount", frame_count);
+    cJSON_AddNumberToObject(json, "processingTimeMs", processing_time_ms);
+
+    // Add metadata if provided
+    if (metadata_json && strlen(metadata_json) > 0) {
+        cJSON *metadata = cJSON_Parse(metadata_json);
+        if (metadata) {
+            cJSON_AddItemToObject(json, "metadata", metadata);
+        }
+    }
+
+    char *json_str = cJSON_PrintUnformatted(json);
+
+    // Configure curl
+    curl_easy_setopt(curl, CURLOPT_URL, callback_url);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, discard_response_callback);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+
+    // Perform request
+    CURLcode res = curl_easy_perform(curl);
+
+    if (res != CURLE_OK) {
+        fprintf(stderr, "[Callback] Failed to send callback: %s\n", curl_easy_strerror(res));
+    } else {
+        fprintf(stderr, "[Callback] ✓ Sent to %s\n", callback_url);
+    }
+
+    // Cleanup
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    free(json_str);
+    cJSON_Delete(json);
+
+    return (res == CURLE_OK) ? 0 : -1;
+}
+
+// ============================================================================
 // Worker Thread
 // ============================================================================
 
@@ -745,30 +822,76 @@ void *worker_thread(void *arg) {
     ctx.worker_id = worker_id;
     ctx.gpu_id = worker_id / 7;  // Workers 0-6 → GPU 0, Workers 7-13 → GPU 1 (7 per GPU)
 
-    // Initialize CUDA hardware context
-    if (init_hw_device_ctx(&ctx) < 0) {
-        fprintf(stderr, "[Worker %d] Failed to initialize hardware context\n", worker_id);
-        return NULL;
+    // In no-GPU mode, skip hardware initialization
+    if (!no_gpu_mode) {
+        // Initialize CUDA hardware context
+        if (init_hw_device_ctx(&ctx) < 0) {
+            fprintf(stderr, "[Worker %d] Failed to initialize hardware context\n", worker_id);
+            return NULL;
+        }
+
+        // Initialize persistent GPU pipeline (ONCE per worker, not per file!)
+        // This is the key optimization: avoid expensive NVENC/NVDEC session recreation
+        if (setup_persistent_pipeline(&ctx) < 0) {
+            fprintf(stderr, "[Worker %d] Failed to setup persistent pipeline\n", worker_id);
+            return NULL;
+        }
     }
 
-    // Initialize persistent GPU pipeline (ONCE per worker, not per file!)
-    // This is the key optimization: avoid expensive NVENC/NVDEC session recreation
-    if (setup_persistent_pipeline(&ctx) < 0) {
-        fprintf(stderr, "[Worker %d] Failed to setup persistent pipeline\n", worker_id);
-        return NULL;
-    }
-
-    char filename[512];
+    TranscodeJob job;
 
     while (1) {
-        if (!queue_pop(&task_queue, filename)) {
+        if (!queue_pop(&task_queue, &job)) {
             break;
         }
 
-        int result = process_file(&ctx, filename);
+        int result = 0;
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        if (no_gpu_mode) {
+            // Phase 1: No-GPU mode - just echo back input path
+            fprintf(stderr, "[Worker %d] ⚠️  NO-GPU mode: %s (would transcode if GPU available)\n",
+                    worker_id, job.filename);
+
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            int processing_ms = (end.tv_sec - start.tv_sec) * 1000 +
+                               (end.tv_nsec - start.tv_nsec) / 1000000;
+
+            // Send callback with input path as output (Phase 1 behavior)
+            send_completion_callback(job.callback_url, job.filename, job.filename,
+                                    0, processing_ms, job.metadata_json, "completed");
+
+            fprintf(stderr, "[Worker %d] ✓ Acknowledgment sent - S3Uploader will upload raw segment\n",
+                    worker_id);
+            result = 0;
+        } else {
+            // Phase 2: Normal GPU transcoding
+            result = process_file(&ctx, job.filename);
+
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            int processing_ms = (end.tv_sec - start.tv_sec) * 1000 +
+                               (end.tv_nsec - start.tv_nsec) / 1000000;
+
+            // In Phase 2, send callback with transcoded output path
+            if (result == 0) {
+                char output_path[512];
+                char base_name[256];
+                strncpy(base_name, job.filename, sizeof(base_name) - 1);
+                char *ext = strstr(base_name, ".ts");
+                if (ext) *ext = '\0';
+                snprintf(output_path, sizeof(output_path), "%s_h264.ts", base_name);
+
+                send_completion_callback(job.callback_url, job.filename, output_path,
+                                        0, processing_ms, job.metadata_json, "completed");
+            } else {
+                send_completion_callback(job.callback_url, job.filename, "",
+                                        0, processing_ms, job.metadata_json, "failed");
+            }
+        }
 
         if (result == 0) {
-            mark_file_processed(&processed_files, filename);
+            mark_file_processed(&processed_files, job.filename);
             pthread_mutex_lock(&stats_mutex);
             files_processed++;
             pthread_mutex_unlock(&stats_mutex);
@@ -779,18 +902,22 @@ void *worker_thread(void *arg) {
         }
 
         // Cleanup only per-file resources (NOT the persistent pipeline!)
-        cleanup_file_contexts(&ctx);
+        if (!no_gpu_mode) {
+            cleanup_file_contexts(&ctx);
+        }
     }
 
     // Final cleanup - destroy persistent pipeline
-    cleanup_persistent_pipeline(&ctx);
+    if (!no_gpu_mode) {
+        cleanup_persistent_pipeline(&ctx);
 
-    if (ctx.cuda_stream) {
-        cudaStreamSynchronize(ctx.cuda_stream);
-        cudaStreamDestroy(ctx.cuda_stream);
-    }
-    if (ctx.hw_device_ctx) {
-        av_buffer_unref(&ctx.hw_device_ctx);
+        if (ctx.cuda_stream) {
+            cudaStreamSynchronize(ctx.cuda_stream);
+            cudaStreamDestroy(ctx.cuda_stream);
+        }
+        if (ctx.hw_device_ctx) {
+            av_buffer_unref(&ctx.hw_device_ctx);
+        }
     }
 
     fprintf(stderr, "[Worker %d] Finished\n", worker_id);
@@ -816,7 +943,10 @@ void *scanner_thread(void *arg) {
     while ((entry = readdir(dir)) != NULL) {
         if (strstr(entry->d_name, ".ts") && !strstr(entry->d_name, "_h264.ts")) {
             if (!is_file_processed(&processed_files, entry->d_name)) {
-                queue_push(&task_queue, entry->d_name);
+                TranscodeJob job = {0};
+                strncpy(job.filename, entry->d_name, sizeof(job.filename) - 1);
+                // No callback URL in batch mode
+                queue_push(&task_queue, &job);
                 discovered++;
             }
         }
@@ -881,35 +1011,22 @@ static enum MHD_Result handle_enqueue(struct MHD_Connection *connection,
         return send_response(connection, 400, "{\"error\":\"Invalid JSON\"}");
     }
 
-    cJSON *filename_item = cJSON_GetObjectItem(json, "filename");
-    if (!filename_item || !cJSON_IsString(filename_item)) {
+    // Get inputPath (full path to file)
+    cJSON *input_path_item = cJSON_GetObjectItem(json, "inputPath");
+    if (!input_path_item || !cJSON_IsString(input_path_item)) {
         cJSON_Delete(json);
-        return send_response(connection, 400, "{\"error\":\"Missing 'filename' field\"}");
+        return send_response(connection, 400, "{\"error\":\"Missing 'inputPath' field\"}");
     }
 
-    const char *filename = filename_item->valuestring;
+    const char *input_path = input_path_item->valuestring;
 
-    // Validate filename (prevent directory traversal)
-    if (strstr(filename, "..") || strstr(filename, "/")) {
-        cJSON_Delete(json);
-        return send_response(connection, 400, "{\"error\":\"Invalid filename (no path allowed)\"}");
-    }
-
-    // Check file extension
-    if (!strstr(filename, ".ts") || strstr(filename, "_h264.ts")) {
-        cJSON_Delete(json);
-        return send_response(connection, 400, "{\"error\":\"Invalid file type (must be .ts, not _h264.ts)\"}");
-    }
-
-    // Check file exists
-    char fullpath[512];
-    snprintf(fullpath, sizeof(fullpath), "%s/%s", INPUT_DIR, filename);
-    if (access(fullpath, F_OK) != 0) {
+    // Validate path exists
+    if (access(input_path, F_OK) != 0) {
         cJSON_Delete(json);
 
         cJSON *error_response = cJSON_CreateObject();
         cJSON_AddStringToObject(error_response, "error", "File not found");
-        cJSON_AddStringToObject(error_response, "filename", filename);
+        cJSON_AddStringToObject(error_response, "inputPath", input_path);
         char *error_str = cJSON_Print(error_response);
         enum MHD_Result ret = send_response(connection, 404, error_str);
         free(error_str);
@@ -918,8 +1035,23 @@ static enum MHD_Result handle_enqueue(struct MHD_Connection *connection,
         return ret;
     }
 
-    // Skip "already processed" check - always transcode everything in the queue
-    // (User requested: transcode everything, don't skip already processed files)
+    // Get callback URL (optional)
+    const char *callback_url = "";
+    cJSON *callback_item = cJSON_GetObjectItem(json, "callbackUrl");
+    if (callback_item && cJSON_IsString(callback_item)) {
+        callback_url = callback_item->valuestring;
+    }
+
+    // Get metadata (optional)
+    char metadata_json[2048] = {0};
+    cJSON *metadata_item = cJSON_GetObjectItem(json, "metadata");
+    if (metadata_item) {
+        char *metadata_str = cJSON_PrintUnformatted(metadata_item);
+        if (metadata_str) {
+            strncpy(metadata_json, metadata_str, sizeof(metadata_json) - 1);
+            free(metadata_str);
+        }
+    }
 
     // Check queue capacity
     pthread_mutex_lock(&task_queue.mutex);
@@ -943,15 +1075,21 @@ static enum MHD_Result handle_enqueue(struct MHD_Connection *connection,
         return ret;
     }
 
-    // Add to queue
-    queue_push(&task_queue, filename);
+    // Create job
+    TranscodeJob job = {0};
+    strncpy(job.filename, input_path, sizeof(job.filename) - 1);
+    strncpy(job.callback_url, callback_url, sizeof(job.callback_url) - 1);
+    strncpy(job.metadata_json, metadata_json, sizeof(job.metadata_json) - 1);
 
-    fprintf(stderr, "[API] Enqueued: %s (queue depth: %d)\n", filename, queue_depth + 1);
+    // Add to queue
+    queue_push(&task_queue, &job);
+
+    fprintf(stderr, "[API] Enqueued: %s (queue depth: %d)\n", input_path, queue_depth + 1);
 
     // Success response
     cJSON *success_response = cJSON_CreateObject();
     cJSON_AddStringToObject(success_response, "status", "queued");
-    cJSON_AddStringToObject(success_response, "filename", filename);
+    cJSON_AddStringToObject(success_response, "inputPath", input_path);
     cJSON_AddNumberToObject(success_response, "queue_depth", queue_depth + 1);
     char *success_str = cJSON_Print(success_response);
 
@@ -1097,11 +1235,22 @@ static enum MHD_Result http_handler(void *cls,
 // ============================================================================
 
 int main(int argc, char **argv) {
-    fprintf(stderr, "=======================================================\n");
-    fprintf(stderr, "GPU-Accelerated Transcoder - Daemon Mode\n");
-    fprintf(stderr, "Target: 1000+ files/minute\n");
-    fprintf(stderr, "Pipeline: NVDEC → NVENC (GPU-ONLY, NO CPU FALLBACK)\n");
-    fprintf(stderr, "=======================================================\n\n");
+    // Check for no-GPU mode (Phase 1 testing)
+    int arg_start = 1;
+    if (argc > 1 && strcmp(argv[1], "--no-gpu") == 0) {
+        no_gpu_mode = 1;
+        arg_start = 2;
+        fprintf(stderr, "=======================================================\n");
+        fprintf(stderr, "⚠️  NO-GPU TEST MODE (Phase 1)\n");
+        fprintf(stderr, "File copy instead of transcoding - testing only!\n");
+        fprintf(stderr, "=======================================================\n\n");
+    } else {
+        fprintf(stderr, "=======================================================\n");
+        fprintf(stderr, "GPU-Accelerated Transcoder - Daemon Mode\n");
+        fprintf(stderr, "Target: 1000+ files/minute\n");
+        fprintf(stderr, "Pipeline: NVDEC → NVENC (GPU-ONLY, NO CPU FALLBACK)\n");
+        fprintf(stderr, "=======================================================\n\n");
+    }
 
     // Record start time
     start_time = time(NULL);
@@ -1119,7 +1268,7 @@ int main(int argc, char **argv) {
 
     // Check if running in batch mode or daemon mode
     int daemon_mode = 1;
-    if (argc > 1 && strcmp(argv[1], "--batch") == 0) {
+    if (argc > arg_start && strcmp(argv[arg_start], "--batch") == 0) {
         daemon_mode = 0;
     }
 

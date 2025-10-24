@@ -1,0 +1,17 @@
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+
+RUN apt-get update && apt-get install -y \
+    ffmpeg libavformat-dev libavcodec-dev libavutil-dev \
+    libavfilter-dev libswresample-dev libmicrohttpd-dev \
+    libcurl4-openssl-dev libcjson-dev build-essential curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY ./transcoder.c ./Makefile ./
+RUN make clean && make
+
+WORKDIR /workspace
+RUN mkdir -p tsfiles output
+
+EXPOSE 8080
+CMD ["/app/transcoder"]
