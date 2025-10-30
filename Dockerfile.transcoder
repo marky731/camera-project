@@ -1,17 +1,28 @@
-FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
+# Build stage - uses devel for compilation tools
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS builder
 
 RUN apt-get update && apt-get install -y \
     ffmpeg libavformat-dev libavcodec-dev libavutil-dev \
     libavfilter-dev libswresample-dev libmicrohttpd-dev \
-    libcurl4-openssl-dev libcjson-dev build-essential curl \
+    libcurl4-openssl-dev libcjson-dev build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY ./transcoder.c ./Makefile ./
 RUN make clean && make
 
+# Runtime stage - only runtime libraries needed
+FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
+
+RUN apt-get update && apt-get install -y \
+    ffmpeg libmicrohttpd12 libcurl4 libcjson1 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /workspace
 RUN mkdir -p tsfiles output
+
+# Copy only the compiled binary from builder stage
+COPY --from=builder /app/transcoder /app/transcoder
 
 EXPOSE 8080
 CMD ["/app/transcoder"]
