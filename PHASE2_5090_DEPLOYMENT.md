@@ -253,7 +253,82 @@ nano .env  # Edit with your credentials
 
 **When you SSH into RunPod and start working there, follow these steps:**
 
-#### Step 1: Extract Deployment Files
+#### Step 0: Install Docker (if not installed)
+
+**Check if Docker is installed:**
+```bash
+docker --version
+```
+
+**If Docker is not found, install it:**
+
+```bash
+# Update package list
+apt-get update
+
+# Install required packages
+apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+
+# Add Docker's official GPG key
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+
+# Add Docker repository
+add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+
+# Update package list again
+apt-get update
+
+# Install Docker CE
+apt-get install -y docker-ce docker-ce-cli containerd.io
+
+# Start and enable Docker
+systemctl start docker
+systemctl enable docker
+
+# Verify Docker installation
+docker --version
+docker run hello-world
+```
+
+**Install Docker Compose:**
+```bash
+# Download Docker Compose
+curl -L "https://github.com/docker/compose/releases/download/v2.24.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+
+# Make it executable
+chmod +x /usr/local/bin/docker-compose
+
+# Verify installation
+docker-compose --version
+```
+
+**Install NVIDIA Docker Runtime (for GPU support):**
+```bash
+# Add NVIDIA Docker repository
+distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | apt-key add -
+curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | tee /etc/apt/sources.list.d/nvidia-docker.list
+
+# Update package list
+apt-get update
+
+# Install nvidia-docker2
+apt-get install -y nvidia-docker2
+
+# Restart Docker to apply changes
+systemctl restart docker
+
+# Test GPU access with Docker
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
+```
+
+**If the test succeeds, you'll see the GPU information. Continue to Step 1.**
+
+---
+
+#### Step 1: Setup Deployment Files
+
+**Option A: If you transferred tar.gz file:**
 ```bash
 cd /workspace
 tar xzf 5090-deployment.tar.gz
@@ -263,6 +338,20 @@ mkdir -p camera-v2
 mv docker-compose.5090.yml camera-v2/docker-compose.yml
 mv .env.5090 camera-v2/.env
 cd camera-v2
+```
+
+**Option B: If you pulled git repos:**
+```bash
+cd /workspace
+
+# Assuming you have camera-project git repo
+cd camera-project/camera-v2
+
+# Copy deployment files
+cp docker-compose.5090.yml docker-compose.yml
+cp .env.5090 .env
+
+# You're now in /workspace/camera-project/camera-v2
 ```
 
 #### Step 2: Configure Environment Variables
